@@ -201,12 +201,20 @@ broker exports. Nothing else in the system needs to change.
 
 ### Reproducibility
 
-Downloads are cached to `data/cache/` as CSV. The first run hits Yahoo; every
-run after that reads the cache and produces **byte-identical** results, even
-though Yahoo's 60-day window slides forward every day. To deliberately refresh,
-pass `--no-cache` or delete the cache file. If you want to reproduce a specific
-report exactly, keep its cache file — the exact configuration used is printed at
-the bottom of every HTML report.
+Downloads are cached to `data/cache/` as CSV, and **the cache files used to
+generate every report in `output/` are committed to this repository.** That is
+deliberate: Yahoo's 60-day intraday window slides forward every single day, so
+without the cache your run next week would silently use different bars and
+produce different numbers.
+
+Because the cache ships with the code, `./run_all.sh` on your machine reproduces
+the committed reports **exactly** — same trades, same P&L, to the rupee. Verify
+it by diffing `output/nifty_15m_trades.csv` against the copy in git after a run;
+it should come back clean.
+
+To pull fresh data instead, pass `--no-cache` or delete the relevant file from
+`data/cache/`. The exact configuration behind any report is printed at the
+bottom of that report's HTML.
 
 ---
 
