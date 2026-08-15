@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Nifty Bank — intraday trend-following
+#
+# Same logic as nifty.yaml. Bank Nifty is roughly 1.4-1.6x as volatile as Nifty,
+# so the parameters that touch volatility are loosened a little: a wider
+# Supertrend band and a wider initial stop, otherwise normal noise stops you out
+# before the move develops.
+# ---------------------------------------------------------------------------
+
+data:
+  symbol: "^NSEBANK"
+  name: "Nifty Bank"
+  interval: "15m"
+  period: "60d"
+  use_cache: true
+  cache_dir: "data/cache"
+  timezone: "Asia/Kolkata"
+  # csv_path: "data/banknifty_5min_2019_2026.csv"
+
+session:
+  market_open: "09:15"
+  market_close: "15:30"
+  entry_start: "09:30"
+  entry_cutoff: "14:45"
+  square_off: "15:15"
+
+strategy:
+  htf_multiplier: 4
+  htf_ema_fast: 20
+  htf_ema_slow: 50
+  htf_slope_lookback: 3
+
+  ema_fast: 9
+  ema_slow: 21
+
+  supertrend_length: 10
+  supertrend_multiplier: 3.0    # wider than Nifty — Bank Nifty whipsaws more
+
+  breakout_length: 20
+  adx_length: 14
+  adx_threshold: 22.0           # slightly stricter; BN produces more fake breaks
+  atr_length: 14
+  min_atr_pct: 0.0006
+
+  stop_atr_multiplier: 1.75     # wider stop for the wider range
+  target_atr_multiplier: 0.0
+  breakeven_atr_multiplier: 1.0
+  use_supertrend_trail: true
+  exit_on_ema_cross: true
+
+  allow_long: true
+  allow_short: true
+
+risk:
+  starting_capital: 1000000.0
+  risk_per_trade_pct: 0.01
+  max_leverage: 5.0
+  lot_size: 35                  # Bank Nifty futures lot size
+  round_to_lots: true
+  daily_loss_limit_pct: 0.02
+  daily_profit_target_pct: 0.0
+  max_trades_per_day: 3
+  max_open_positions: 1
+
+costs:
+  brokerage_per_order: 20.0
+  exchange_txn_pct: 0.0000173
+  stt_sell_pct: 0.0002
+  sebi_fee_pct: 0.000001
+  stamp_duty_pct: 0.00002
+  gst_pct: 0.18
+  slippage_pct: 0.00025         # BN spreads are a touch wider than Nifty
+
+backtest:
+  next_bar_execution: true
+  pessimistic_intrabar: true
+  output_dir: "output"

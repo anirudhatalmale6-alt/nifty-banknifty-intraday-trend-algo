@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Nifty 50 — intraday trend-following
+#
+# Every key below is optional; anything you leave out falls back to the default
+# in src/nifty_algo/config.py. Any key you misspell raises an error rather than
+# being silently ignored.
+# ---------------------------------------------------------------------------
+
+data:
+  symbol: "^NSEI"            # Yahoo Finance ticker for Nifty 50
+  name: "Nifty 50"
+  interval: "15m"            # signal timeframe
+  period: "60d"              # Yahoo caps intraday <=30m history at 60 days
+  use_cache: true            # cached bars = identical results on every re-run
+  cache_dir: "data/cache"
+  timezone: "Asia/Kolkata"
+  # To backtest years of intraday data, export it from your broker and point
+  # here instead. Columns: datetime,open,high,low,close,volume
+  # csv_path: "data/nifty_5min_2019_2026.csv"
+
+session:
+  market_open: "09:15"
+  market_close: "15:30"
+  entry_start: "09:30"       # let the opening auction settle first
+  entry_cutoff: "14:45"      # after this there is not enough day left
+  square_off: "15:15"        # everything flat before the close
+
+strategy:
+  # Higher timeframe trend filter: 15m x 4 = 1 hour
+  htf_multiplier: 4
+  htf_ema_fast: 20
+  htf_ema_slow: 50
+  htf_slope_lookback: 3
+
+  # Signal timeframe
+  ema_fast: 9
+  ema_slow: 21
+
+  supertrend_length: 10
+  supertrend_multiplier: 2.5
+
+  breakout_length: 20        # Donchian lookback for the entry trigger
+  adx_length: 14
+  adx_threshold: 20.0        # below this the tape is chopping — stand aside
+  atr_length: 14
+  min_atr_pct: 0.0005        # skip dead-volatility setups
+
+  # Exits
+  stop_atr_multiplier: 1.5
+  target_atr_multiplier: 0.0   # 0 = no fixed target, let the trail do the work
+  breakeven_atr_multiplier: 1.0
+  use_supertrend_trail: true
+  exit_on_ema_cross: true
+
+  allow_long: true
+  allow_short: true
+
+risk:
+  starting_capital: 1000000.0   # INR 10 lakh
+  risk_per_trade_pct: 0.01      # 1% of equity between entry and the initial stop
+  max_leverage: 5.0
+  lot_size: 75                  # Nifty futures lot size
+  round_to_lots: true
+  daily_loss_limit_pct: 0.02    # stop trading for the day at -2%
+  daily_profit_target_pct: 0.0  # 0 = keep trading when ahead
+  max_trades_per_day: 3
+  max_open_positions: 1
+
+costs:
+  # Discount-broker index futures. Change these if you trade options or pay
+  # percentage brokerage — the backtest is only as honest as this block.
+  brokerage_per_order: 20.0
+  exchange_txn_pct: 0.0000173
+  stt_sell_pct: 0.0002
+  sebi_fee_pct: 0.000001
+  stamp_duty_pct: 0.00002
+  gst_pct: 0.18
+  slippage_pct: 0.0002          # 2 bps one way
+
+backtest:
+  next_bar_execution: true      # fill at the next bar's open — keep this on
+  pessimistic_intrabar: true    # ambiguous bar? assume the stop hit first
+  output_dir: "output"

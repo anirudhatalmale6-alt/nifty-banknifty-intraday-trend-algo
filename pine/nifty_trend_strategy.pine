@@ -1,0 +1,303 @@
+// =============================================================================
+//  Nifty / Bank Nifty — Intraday Trend-Following
+//  Pine Script v5  ·  strategy version
+//
+//  This is a bar-for-bar mirror of the Python engine in src/nifty_algo/.
+//  Same five entry conditions, same exits, same session rules. Put it on a 15m
+//  ^NSEI or ^NSEBANK chart, set the inputs to match your YAML config, and the
+//  arrows should land on the same bars as the Python trade log.
+//
+//  ENTRY — all five must agree at the close of a bar:
+//    1. Higher timeframe trend    fast EMA > slow EMA and slow EMA rising
+//    2. Supertrend direction      already flipped to that side
+//    3. Structure breakout        close beyond the Donchian / opening range
+//    4. Trend strength            ADX at or above the threshold
+//    5. Live volatility           ATR/price above the floor
+//    ... plus: inside the entry window, and the daily trade cap not used up.
+//
+//  EXIT
+//    · initial stop at entry -/+ stopATR x ATR
+//    · stop to break-even once price runs beATR x ATR in favour
+//    · Supertrend flip closes the trade
+//    · optional EMA cross against the position closes the trade
+//    · hard square-off at the configured time — nothing is carried overnight
+//
+//  WHY THE NUMBERS DIFFER SLIGHTLY FROM THE PYTHON RUN
+//    The SIGNALS are identical. The P&L is not, and these are the four reasons:
+//      · Position size. Python sizes every trade from your risk % and the ATR
+//        stop; Pine uses a fixed quantity so the chart stays readable.
+//      · Stop reference price. Python anchors the stop to the actual fill;
+//        Pine anchors it to the signal bar's close. On a gappy open these are
+//        a few points apart.
+//      · Costs. Pine's commission model is a flat cash amount. The Python
+//        engine models brokerage, STT, exchange charges, SEBI fee, stamp duty
+//        and GST separately, which is what you actually pay in India.
+//      · Data. TradingView's index feed is not Yahoo's, and neither is your
+//        broker's.
+//    Treat Pine as the visual proof that the logic is right, and the Python
+//    report as the number you act on.
+//
+//  HOW TO INSTALL
+//    TradingView -> Pine Editor -> paste this file -> Save -> Add to chart.
+//    Set the chart to 15 minutes and the symbol to NSE:NIFTY or NSE:BANKNIFTY.
+//    Then open Strategy Tester to see the trade list.
+// =============================================================================
+
+//@version=5
+strategy("Nifty / Bank Nifty Intraday Trend-Following",
+     shorttitle       = "NF-Trend",
+     overlay          = true,
+     initial_capital  = 1000000,
+     default_qty_type = strategy.fixed,
+     default_qty_value= 75,
+     commission_type  = strategy.commission.cash_per_order,
+     commission_value = 20,
+     slippage         = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = false)
+
+// -----------------------------------------------------------------------------
+// Inputs — mirror these to your YAML config
+// -----------------------------------------------------------------------------
+grpTrend = "1 · Trend filter (higher timeframe)"
+htfMult      = input.int(4,   "Higher timeframe = chart TF x", minval=1, group=grpTrend,
+     tooltip="4 on a 15m chart gives a 1-hour trend read, matching htf_multiplier.")
+htfEmaFast   = input.int(20,  "HTF fast EMA",  minval=2, group=grpTrend)
+htfEmaSlow   = input.int(50,  "HTF slow EMA",  minval=3, group=grpTrend)
+htfSlopeBack = input.int(3,   "HTF slope lookback", minval=1, group=grpTrend)
+
+grpSignal = "2 · Signal timeframe"
+emaFastLen   = input.int(9,   "Fast EMA", minval=2, group=grpSignal)
+emaSlowLen   = input.int(21,  "Slow EMA", minval=3, group=grpSignal)
+stLen        = input.int(10,  "Supertrend ATR length", minval=1, group=grpSignal)
+stMult       = input.float(2.5, "Supertrend multiplier", minval=0.5, step=0.1, group=grpSignal)
+entryMode    = input.string("Donchian breakout", "Entry trigger",
+     options=["Donchian breakout", "Opening range breakout"], group=grpSignal)
+donchianLen  = input.int(20,  "Donchian lookback", minval=2, group=grpSignal)
+orMinutes    = input.int(15,  "Opening range (minutes)", minval=1, group=grpSignal)
+adxLen       = input.int(14,  "ADX length", minval=1, group=grpSignal)
+adxThreshold = input.float(20.0, "ADX threshold", minval=0, step=0.5, group=grpSignal)
+atrLen       = input.int(14,  "ATR length", minval=1, group=grpSignal)
+minAtrPct    = input.float(0.05, "Minimum ATR as % of price", minval=0, step=0.01, group=grpSignal)
+
+grpExit = "3 · Exits"
+stopATR      = input.float(1.5, "Initial stop (x ATR)", minval=0.1, step=0.1, group=grpExit)
+targetATR    = input.float(0.0, "Fixed target (x ATR, 0 = none)", minval=0, step=0.1, group=grpExit)
+beATR        = input.float(1.0, "Move stop to break-even after (x ATR)", minval=0, step=0.1, group=grpExit)
+exitOnFlip   = input.bool(true,  "Exit on Supertrend flip", group=grpExit)
+exitOnEmaX   = input.bool(true,  "Exit on EMA cross against the position", group=grpExit)
+
+grpSession = "4 · Session (exchange time)"
+entryStart   = input.int(930,  "No entries before (HHMM)", group=grpSession,
+     tooltip="Default 09:30 skips the opening auction, matching entry_start in the YAML.")
+entryCutoff  = input.int(1445, "No new entries after (HHMM)", group=grpSession)
+squareOffHHMM= input.int(1515, "Square off at (HHMM)", group=grpSession)
+
+grpRisk = "5 · Risk"
+allowLong    = input.bool(true, "Allow longs",  group=grpRisk)
+allowShort   = input.bool(true, "Allow shorts", group=grpRisk)
+maxTradesDay = input.int(3, "Max entries per day", minval=1, group=grpRisk)
+lotQty       = input.int(75, "Quantity per trade", minval=1, group=grpRisk,
+     tooltip="Nifty futures lot = 75, Bank Nifty = 35. The Python engine sizes " +
+             "this dynamically from your risk %; Pine keeps it fixed so the " +
+             "signals stay easy to read on the chart.")
+
+grpPlot = "6 · Display"
+showSupertrend = input.bool(true, "Plot Supertrend", group=grpPlot)
+showBreakLevel = input.bool(true, "Plot breakout level", group=grpPlot)
+showHtf        = input.bool(true, "Plot higher-timeframe EMAs", group=grpPlot)
+
+// -----------------------------------------------------------------------------
+// 1 · Higher timeframe trend
+//     request.security with lookahead_off is the only safe way to read a slower
+//     timeframe. Without it Pine hands you the *finished* higher-timeframe bar
+//     while it is still forming — pure lookahead, and the single most common
+//     way a Pine strategy fakes a great backtest.
+// -----------------------------------------------------------------------------
+htfRes = timeframe.multiplier * htfMult
+htfTf  = timeframe.isintraday ? str.tostring(htfRes) : timeframe.period
+
+htfEmaF = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaFast),
+     lookahead = barmerge.lookahead_off)
+htfEmaS = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaSlow),
+     lookahead = barmerge.lookahead_off)
+htfEmaSPrev = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, htfEmaSlow)[htfSlopeBack], lookahead = barmerge.lookahead_off)
+
+htfSlope   = htfEmaS - htfEmaSPrev
+htfTrendUp = htfEmaF > htfEmaS and htfSlope > 0
+htfTrendDn = htfEmaF < htfEmaS and htfSlope < 0
+
+// -----------------------------------------------------------------------------
+// 2 · Signal timeframe indicators
+// -----------------------------------------------------------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+atrVal  = ta.atr(atrLen)
+atrPct  = atrVal / close * 100.0
+
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+
+[stLine, stDir] = ta.supertrend(stMult, stLen)
+// ta.supertrend returns -1 for an UPtrend and +1 for a downtrend. Flip it so the
+// sign convention matches the Python engine (+1 up, -1 down) and stays readable.
+stUp = stDir < 0
+
+// -----------------------------------------------------------------------------
+// 3 · The breakout level
+// -----------------------------------------------------------------------------
+// Donchian of the PREVIOUS n bars — the current bar is excluded on purpose,
+// otherwise every bar trivially "breaks out" of a range it helped create.
+dcUpper = ta.highest(high, donchianLen)[1]
+dcLower = ta.lowest(low,  donchianLen)[1]
+
+// Opening range: high/low of the first orMinutes of the session, held for the
+// rest of the day and blank while the range is still forming.
+var float orHigh = na
+var float orLow  = na
+var int   orEndMs = na
+
+newDay = ta.change(time("D")) != 0
+if newDay
+    orHigh  := na
+    orLow   := na
+    orEndMs := time + orMinutes * 60 * 1000
+
+inOpeningRange = not na(orEndMs) and time < orEndMs
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+useOR    = entryMode == "Opening range breakout"
+// While the range is still forming its level is not knowable, so it is na.
+breakUp  = useOR ? (inOpeningRange ? na : orHigh) : dcUpper
+breakDn  = useOR ? (inOpeningRange ? na : orLow)  : dcLower
+
+// -----------------------------------------------------------------------------
+// 4 · Session gates
+// -----------------------------------------------------------------------------
+nowHHMM      = hour * 100 + minute
+afterStart   = nowHHMM >= entryStart
+beforeCutoff = nowHHMM <= entryCutoff
+isSquareOff  = nowHHMM >= squareOffHHMM
+canEnterTime = timeframe.isintraday ? (afterStart and beforeCutoff and not isSquareOff) : true
+
+// Daily entry counter — reset on the first bar of each session.
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+
+// -----------------------------------------------------------------------------
+// 5 · The five conditions
+// -----------------------------------------------------------------------------
+strongTrend = adxVal >= adxThreshold
+aliveVol    = atrPct >= minAtrPct
+
+longSetup = allowLong and htfTrendUp and stUp and not na(breakUp)
+     and close > breakUp and strongTrend and aliveVol and emaFast > emaSlow
+     and canEnterTime and tradesToday < maxTradesDay
+
+shortSetup = allowShort and htfTrendDn and not stUp and not na(breakDn)
+     and close < breakDn and strongTrend and aliveVol and emaFast < emaSlow
+     and canEnterTime and tradesToday < maxTradesDay
+
+// -----------------------------------------------------------------------------
+// 6 · Orders
+// -----------------------------------------------------------------------------
+// Stop levels are frozen at entry from the ATR of the signal bar — the same bar
+// the Python engine uses. They are stored in vars so the trailing logic below
+// can only ever tighten them.
+var float posStop   = na
+var float posTarget = na
+var float entryAtr  = na
+var bool  beDone    = false
+
+flat = strategy.position_size == 0
+
+if longSetup and flat
+    strategy.entry("Long", strategy.long, qty = lotQty)
+    entryAtr  := atrVal
+    posStop   := close - stopATR * atrVal
+    posTarget := targetATR > 0 ? close + targetATR * atrVal : na
+    beDone    := false
+    tradesToday += 1
+
+if shortSetup and flat
+    strategy.entry("Short", strategy.short, qty = lotQty)
+    entryAtr  := atrVal
+    posStop   := close + stopATR * atrVal
+    posTarget := targetATR > 0 ? close - targetATR * atrVal : na
+    beDone    := false
+    tradesToday += 1
+
+// --- break-even move ---------------------------------------------------------
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avg     = strategy.position_avg_price
+
+if inLong and not beDone and beATR > 0 and close - avg >= beATR * entryAtr
+    posStop := math.max(nz(posStop, avg), avg)
+    beDone  := true
+if inShort and not beDone and beATR > 0 and avg - close >= beATR * entryAtr
+    posStop := math.min(nz(posStop, avg), avg)
+    beDone  := true
+
+// --- resting stop / target ---------------------------------------------------
+if inLong
+    strategy.exit("L-exit", from_entry = "Long", stop = posStop, limit = posTarget)
+if inShort
+    strategy.exit("S-exit", from_entry = "Short", stop = posStop, limit = posTarget)
+
+// --- signal exits ------------------------------------------------------------
+if inLong and exitOnFlip and not stUp
+    strategy.close("Long", comment = "ST flip")
+if inShort and exitOnFlip and stUp
+    strategy.close("Short", comment = "ST flip")
+
+if inLong and exitOnEmaX and emaFast < emaSlow
+    strategy.close("Long", comment = "EMA cross")
+if inShort and exitOnEmaX and emaFast > emaSlow
+    strategy.close("Short", comment = "EMA cross")
+
+// --- hard square-off ---------------------------------------------------------
+// Nothing is ever carried overnight. This runs last so it overrides everything.
+if timeframe.isintraday and isSquareOff and not flat
+    strategy.close_all(comment = "Square off")
+
+// -----------------------------------------------------------------------------
+// 7 · Plots
+// -----------------------------------------------------------------------------
+plot(showSupertrend and stUp     ? stLine : na, "Supertrend up",
+     color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(showSupertrend and not stUp ? stLine : na, "Supertrend down",
+     color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+
+plot(showBreakLevel ? breakUp : na, "Breakout level (up)",
+     color = color.new(color.teal, 40), style = plot.style_linebr)
+plot(showBreakLevel ? breakDn : na, "Breakout level (down)",
+     color = color.new(color.maroon, 40), style = plot.style_linebr)
+
+plot(showHtf ? htfEmaF : na, "HTF fast EMA", color = color.new(color.blue, 55))
+plot(showHtf ? htfEmaS : na, "HTF slow EMA", color = color.new(color.orange, 55))
+
+plot(strategy.position_size != 0 ? posStop : na, "Active stop",
+     color = color.new(color.fuchsia, 0), style = plot.style_cross, linewidth = 1)
+
+// Background tint shows which way the higher timeframe says the river is flowing.
+bgcolor(htfTrendUp ? color.new(color.green, 94)
+      : htfTrendDn ? color.new(color.red, 94) : na, title = "HTF trend")
+
+plotshape(longSetup and flat,  "Long entry",  shape.triangleup,
+     location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(shortSetup and flat, "Short entry", shape.triangledown,
+     location.abovebar, color.new(color.red, 0),   size = size.small)
+
+// -----------------------------------------------------------------------------
+// 8 · Live alerts — wire these to your broker bridge if you go live
+// -----------------------------------------------------------------------------
+alertcondition(longSetup  and flat, "Long entry signal",
+     "TREND LONG {{ticker}} @ {{close}}")
+alertcondition(shortSetup and flat, "Short entry signal",
+     "TREND SHORT {{ticker}} @ {{close}}")
+alertcondition(timeframe.isintraday and isSquareOff, "Square off",
+     "SQUARE OFF {{ticker}} @ {{close}}")

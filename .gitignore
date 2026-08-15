@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Cached market data — regenerated on first run. Keep if you need to
+# reproduce a specific report exactly.
+data/cache/*.csv
